@@ -12,7 +12,21 @@ and `awk`, linked with `--source-path`.
 (rx/prefilter pattern ere?)               ; newline-separated literal runs, one of which
                                           ; every matching line holds; "" when none
 (rx/holds-run? line runs 0)               ; does the line hold one? (a host search)
+(rx/captures prog text lo hi se)          ; the groups of the match se (find's answer):
+                                          ; ten "start:end;" tokens, group 0 the match
+(rx/group-count pattern ere?)             ; how many groups the pattern opens
 ```
+
+Capture groups (2026-09-17): the simulation keeps no per-thread state, so
+once `find` has the span the groups come from a second walk of the program
+over exactly that span, depth first, greedy branch first — the first walk
+that reaches the match at the span's end. That is what macOS libc regex
+answers (`(a|ab)(c|bcd)` over `abcd` is `[a][bcd]`, `(ab)*` over `abab` is
+the last iteration `[ab]`), measured on `/usr/bin/sed -E`, not the POSIX
+subexpression rule; 20 cases in the suite pin those answers. The walk
+remembers the epsilon instructions visited at each position, so `(a*)*`
+cannot loop; it is exponential in the worst case, over a span already known
+to match.
 
 The prefilter is what makes the measured `-E` alternations of words run at
 the system utility's speed: `SIGILL|static_assert` over 5.4 MB is 10.4 s
@@ -40,7 +54,7 @@ POSIX classes, `^` `$`, `\` escapes (a literal metacharacter; `\w \W \d \D
 `test/regex_test.cljk` compiles a driver that links the module, packages
 it, and compares its first match on each (pattern, line) against
 `/usr/bin/grep -ob` — POSIX leftmost-longest with byte offsets — for 90
-cases (each construct and its edges, `a|ab` → `ab`, `(a|ab)(c|bcd)` →
+cases (plus 20 capture cases against `/usr/bin/sed`'s answers) (each construct and its edges, `a|ab` → `ab`, `(a|ab)(c|bcd)` →
 `abcd`, multi-byte lines and classes, `(a*)*b`, the BRE context rules
 below) plus 10 patterns both sides refuse. All byte-identical.
 
@@ -83,7 +97,8 @@ one-or-more and optional in BRE as `/usr/bin/grep` reads them — where
 
 ## What this is not
 
-No back-references, no collating symbols (`[[.a.]]`) or equivalence classes
+No back-references IN a pattern (`\1` matching what group 1 matched:
+not regular), no collating symbols (`[[.a.]]`) or equivalence classes
 (`[[=a=]]`), no lazy quantifiers (`*?`, a TRE extension `/usr/bin/grep`
 accepts), no `\<` `\>`. Case folding is the caller's (ASCII, before
 compiling). Lines are at most 2²¹ bytes and a program 8,649 records.

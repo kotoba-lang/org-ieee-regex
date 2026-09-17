@@ -49,6 +49,32 @@
    ["B" "b$\\|x" "ab$"] ["B" "x\\|b$" "ab"] ["B" "\\(b$\\)" "ab"] ["B" "\\(b$\\)" "ab$"]
    ["B" "a\\tb" "a\tb"] ["B" "a\\tb" "atb"] ["B" "ab\\{0,1\\}c" "ac"] ["E" "ab?c" "ac"] ["E" "ab{0,1}c" "ac"] ["E" "(ab|cd)e" "xcde"] ["E" "a\\tb" "a\tb"] ["E" "a^b" "a^b"] ["E" "a$b" "a$b"]])
 
+;; Capture groups (2026-09-17): the groups of the first match as byte
+;; offsets, each expectation measured on /usr/bin/sed -E (BRE: sed) with
+;; `s/RE/[\1][\2]/` -- macOS libc regex's greedy-first answers, which the
+;; backtracking walk reproduces: `(a|ab)(c|bcd)` over abcd is [a][bcd].
+(def capture-cases
+  [["EC" "(a|ab)(c|bcd)" "abcd" "0:4;0:1;1:4;"]
+   ["EC" "(x*)(.*)" "xyz" "0:3;0:1;1:3;"]
+   ["EC" "(a*)(a*)" "aaa" "0:3;0:3;3:3;"]
+   ["EC" "(a)|(b)" "ab" "0:1;0:1;-1:-1;"]
+   ["EC" "(a)|(b)" "b" "0:1;-1:-1;0:1;"]
+   ["EC" "(a)(b)?" "ab" "0:2;0:1;1:2;"]
+   ["EC" "(a)(b)?" "ac" "0:1;0:1;-1:-1;"]
+   ["EC" "(ab)*" "abab" "0:4;2:4;"]
+   ["EC" "((a)b)" "ab" "0:2;0:2;0:1;"]
+   ["EC" "(a)+" "aa" "0:2;1:2;"]
+   ["EC" "^(FAIL|ERROR) in \\(([^)]*)\\) \\(([^:]*):.*" "FAIL in (x) (f:1) rest" "0:22;0:4;9:10;13:14;"]
+   ["EC" "(sk_live_|sk_test_)[A-Za-z0-9_]+" "sk_live_abcdef123" "0:17;0:8;"]
+   ["EC" "([a-z0-9])([A-Z])" "fooBarBaz" "2:4;2:3;3:4;"]
+   ["EC" "[(]a(b)" "(ab" "0:3;2:3;"]
+   ["EC" "(日)(本)" "x日本" "1:7;1:4;4:7;"]
+   ["EC" "b" "abc" "1:2;"]
+   ["BC" ".*\"\\(.*\\)\"" "foo \"bar\" baz" "0:9;5:8;"]
+   ["BC" ".*:offset \\([0-9]*\\).*" ":offset 42 x" "0:12;8:10;"]
+   ["BC" "\\(a\\)\\(b\\)" "ab" "0:2;0:1;1:2;"]
+   ["EC" "(a*)*b" "aaab" "0:4;0:3;"]])
+
 ;; Patterns that must be refused (grep's own message differs; the exit 2 is
 ;; what is compared, the message is ours).
 (def refusals
@@ -93,7 +119,15 @@
             (let [k (run exe [d pat] {:input line})
                   ok? (and (= 2 (:status k)) (str/starts-with? (:out k) "!"))]
               {:case [d pat line :refused] :ok ok? :kotoba (:out k) :system "(exit 2, ! message)" :exit [(:status k) 2]}))
-          all (concat results refusal-results)
+          capture-results
+          (for [[d pat line want] capture-cases]
+            (let [k (run exe [d pat] {:input line})
+                  ;; the expectation lists the groups the pattern has; the
+                  ;; driver pads to ten with -1:-1
+                  want-full (str want (apply str (repeat (- 10 (count (re-seq #";" want))) "-1:-1;")) "\n")
+                  ok? (and (= 0 (:status k)) (= (:out k) want-full))]
+              {:case [d pat line] :ok ok? :kotoba (:out k) :system want-full :exit [(:status k) 0]}))
+          all (concat results refusal-results capture-results)
           bad (remove :ok all)]
       (doseq [r all]
         (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:case r)) " -> " (pr-str (:kotoba r))
