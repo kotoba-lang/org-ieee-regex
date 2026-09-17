@@ -10,6 +10,13 @@
 ;;                                     which every matching line holds, or
 ;;                                     "" when the pattern yields none
 ;;   (holds-run? line runs i)       -> does the line hold one of the runs?
+;;   (captures prog text lo hi se)  -> the groups of the match se (start *
+;;                                     2^32 + end, as find answers) as ten
+;;                                     `start:end;` tokens, group 0 the
+;;                                     match, -1:-1 a group that did not
+;;                                     take part; "!" when the span cannot
+;;                                     be re-walked
+;;   (group-count pattern ere?)     -> how many groups the pattern opens
 ;;
 ;; ## Measured, 2026-09-17
 ;;
@@ -70,10 +77,12 @@
 ;;   j a      jump to pc + a
 ;;   ^  $     assert the line start / end
 ;;   b neg    assert a word boundary (neg = 1: not one)
+;;   o k      open capture group k (2026-09-17; inert in the simulation)
+;;   l k      close capture group k
 ;;   m        match
 ;;
 ;; Offsets are stored plus 5000000, so a negative one is a smaller number.
-(ns regex.core (:export [compile-pattern find matches? error? prefilter holds-run?]))
+(ns regex.core (:export [compile-pattern find matches? error? prefilter holds-run? captures group-count]))
 
 ;; --- numbers and records ------------------------------------------------------
 
@@ -332,6 +341,32 @@
                 (parse-quants p (pos-of r) (prog-of r) ere?)))
             (answer i e)))))))
 
+;; How many groups open in P before position UNTIL (ERE `(`, BRE `\(`),
+;; walking from I: a group's number is its opening order, and since the
+;; parser knows where each group starts, the number needs no threading.
+;; Brackets are skipped so `[(]` does not count.
+(defn- opens-before [p :string i :i64 until :i64 acc :i64 ere? :bool] :i64
+  (if (>= i until)
+    acc
+    (let [c (at p i)]
+      (if (= c 92)
+        (opens-before p (+ i 2) until (+ acc (if (if (not ere?) (= (at p (+ i 1)) 40) false) 1 0)) ere?)
+        (if (= c 91)
+          (opens-before p (bracket-end p (+ i 1)) until acc ere?)
+          (opens-before p (+ i (cp-width c)) until (+ acc (if (if ere? (= c 40) false) 1 0)) ere?))))))
+
+;; The index just past the `]` closing the bracket expression whose body
+;; starts at I (a `]` first is a literal); the end of P when unclosed.
+(defn- bracket-end [p :string i :i64] :i64
+  (let [n (string-byte-length p)
+        j (if (= (at p i) 94) (+ i 1) i)
+        k (if (= (at p j) 93) (+ j 1) j)
+        e (string-index-of-from p "]" k)]
+    (if (< e 0) n (+ e 1))))
+
+(defn group-count [pattern :string ere? :bool] :i64
+  (opens-before pattern 0 (string-byte-length pattern) 0 ere?))
+
 ;; One atom at I. Answers NNNNNN + program, or `!`.
 (defn- parse-atom [p :string i :i64 ere? :bool] :string
   (let [c (at p i)]
@@ -346,13 +381,15 @@
             (if (= c 91)
               (parse-class p (+ i 1))
               (if (if ere? (= c 40) (if (= c 92) (= (at p (+ i 1)) 40) false))
-                (let [r (parse-alt p (+ i (if ere? 1 2)) ere?)]
+                (let [r (parse-alt p (+ i (if ere? 1 2)) ere?)
+                      k (+ 1 (opens-before p 0 i 0 ere?))]
                   (if (failed? r)
                     r
                     (let [j (pos-of r)
                           close? (if ere? (= (at p j) 41) (if (= (at p j) 92) (= (at p (+ j 1)) 41) false))]
                       (if close?
-                        (answer (+ j (if ere? 1 2)) (prog-of r))
+                        (answer (+ j (if ere? 1 2))
+                                (string-concat (rec "o" k 0) (string-concat (prog-of r) (rec "l" k 0))))
                         (oops "parentheses ( ) not balanced")))))
                 (if (= c 92)
                   ;; An escape: a class letter, a boundary, or the literal
@@ -611,7 +648,9 @@
                     seen))
                 (if (= op 109)
                   (string-concat seen "M;")
-                  seen)))))))))
+                  (if (if (= op 111) true (= op 108))
+                    (add-thread prog seen (+ pc 1) line ph)
+                    seen))))))))))
 
 ;; Does the class at PC (n ranges after it) hold C?
 (defn- in-ranges? [prog :string pc :i64 n :i64 c :i64] :bool
@@ -729,3 +768,115 @@
 
 (defn matches? [prog :string text :string lo :i64 hi :i64] :bool
   (arena-scope (run-any prog (string-substring text lo hi) "" (pack-ph 0 -1))))
+
+;; --- captures: the groups of a match already found ---------------------------
+;;
+;; The simulation keeps no per-thread state, so once `find` has the span
+;; [s, e) the groups are found by walking the program again over exactly
+;; that span, depth first, the greedy branch first (every split in this
+;; compiler puts the greedy continuation in `a`): the first walk that
+;; reaches `m` at e is the answer. That is what macOS libc regex answers
+;; (measured 2026-09-17 on /usr/bin/sed -E: `(a|ab)(c|bcd)` over abcd is
+;; [a][bcd], `(a*)(a*)` over aaa is [aaa][], `(ab)*` over abab is [ab] --
+;; the last iteration, `(a)(b)?` over ab is [a][b]), not the POSIX
+;; subexpression rule. Per position the epsilon instructions visited are
+;; remembered so `(a*)*` cannot loop; a walk is exponential in the worst
+;; case and the span is a known match, so the greedy walk succeeds first
+;; on every measured pattern.
+;;
+;; The state string: seven digits of END, then ten groups of seven-digit
+;; start and end (9999999 = unset), then `|` and the `pc;` tokens visited
+;; at the current position.
+(defn- cap-field [st :string k :i64] :i64
+  (text->i64 st (+ 7 (* 14 k)) (+ 14 (* 14 k)) 0))
+
+(defn- cap-end-field [st :string k :i64] :i64
+  (text->i64 st (+ 14 (* 14 k)) (+ 21 (* 14 k)) 0))
+
+(defn- caps-part [st :string] :string (string-substring st 0 147))
+
+(defn- visited-part [st :string] :string (string-substring st 148 (string-byte-length st)))
+
+(defn- with-field [st :string at :i64 v :i64] :string
+  (string-concat (string-substring st 0 at)
+                 (string-concat (seven v) (string-substring st (+ at 7) (string-byte-length st)))))
+
+(defn- visited? [st :string pc :i64] :bool
+  (>= (string-index-of (string-concat ";" (visited-part st)) (string-concat ";" (token pc))) 0))
+
+(defn- visit [st :string pc :i64] :string (string-concat st (token pc)))
+
+;; The walk from PC at PH with state ST: the 147-character caps on
+;; success, "!" on failure.
+(defn- bt [prog :string line :string pc :i64 ph :i64 st :string] :string
+  (let [op (op-at prog pc)
+        pos (ph-pos ph)
+        prev (ph-prev ph)
+        n (string-byte-length line)
+        end (text->i64 st 0 7 0)]
+    (if (= op 109)
+      (if (= pos end) (caps-part st) "!")
+      (if (if (= op 99) true (if (= op 97) true (= op 107)))
+        (if (>= pos end)
+          "!"
+          (let [c (string-code-point-at line pos)
+                ok? (if (= op 99)
+                      (= c (a-at prog pc))
+                      (if (= op 97)
+                        (not (= c 10))
+                        (not (= (in-ranges? prog (+ pc 1) (a-at prog pc) c) (= 1 (b-at prog pc))))))
+                advance (if (= op 107) (+ (+ pc 1) (a-at prog pc)) (+ pc 1))]
+            (if ok?
+              (bt prog line advance (pack-ph (+ pos (cp-width c)) c) (string-concat (caps-part st) "|"))
+              "!")))
+        (if (visited? st pc)
+          "!"
+          (let [seen (visit st pc)]
+            (if (= op 115)
+              (let [r (bt prog line (target-a prog pc) ph seen)]
+                (if (string=? r "!") (bt prog line (target-b prog pc) ph seen) r))
+              (if (= op 106)
+                (bt prog line (target-a prog pc) ph seen)
+                (if (= op 94)
+                  (if (= pos 0) (bt prog line (+ pc 1) ph seen) "!")
+                  (if (= op 36)
+                    (if (= pos n) (bt prog line (+ pc 1) ph seen) "!")
+                    (if (= op 98)
+                      (let [before (word-char? prev)
+                            after (word-char? (if (< pos n) (string-code-point-at line pos) -1))]
+                        (if (= (not (= before after)) (= 0 (a-at prog pc)))
+                          (bt prog line (+ pc 1) ph seen)
+                          "!"))
+                      (if (= op 111)
+                        (bt prog line (+ pc 1) ph (with-field seen (+ 7 (* 14 (a-at prog pc))) pos))
+                        (if (= op 108)
+                          (bt prog line (+ pc 1) ph (with-field seen (+ 14 (* 14 (a-at prog pc))) pos))
+                          "!")))))))))))))
+
+(defn- unset-groups [k :i64 acc :string] :string
+  (if (<= k 0) acc (unset-groups (- k 1) (string-concat acc "99999999999999"))))
+
+;; The tokens `start:end;` for groups 0..9 from the caps, LO added; a group
+;; whose start or end is unset, or whose end precedes its start, is -1:-1.
+(defn- render-groups [caps :string k :i64 lo :i64 acc :string] :string
+  (if (> k 9)
+    acc
+    (let [s (cap-field caps k)
+          e (cap-end-field caps k)
+          ok? (if (< s 9999999) (if (< e 9999999) (>= e s) false) false)
+          tok (if ok?
+                (string-concat (decimal-of (+ lo s)) (string-concat ":" (string-concat (decimal-of (+ lo e)) ";")))
+                "-1:-1;")]
+      (render-groups caps (+ k 1) lo (string-concat acc tok)))))
+
+;; Every allocation in here is the caller's to reclaim (a string cannot
+;; leave a region): wrap the call in an arena-scope where the answer is
+;; consumed.
+(defn captures [prog :string text :string lo :i64 hi :i64 se :i64] :string
+  (let [line (string-substring text lo hi)
+        s (- (quot se 4294967296) lo)
+        e (- (- se (* 4294967296 (quot se 4294967296))) lo)
+        st (string-concat (seven e)
+                          (string-concat (seven s) (string-concat (seven e) (string-concat (unset-groups 9 "") "|"))))
+        caps (bt prog line 0 (pack-ph s (prev-before line 0 s -1)) st)]
+    (if (string=? caps "!") "!" (render-groups caps 0 lo ""))))

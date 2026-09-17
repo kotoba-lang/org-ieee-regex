@@ -14,7 +14,27 @@
 (defn decimal-of [n :i64] :string
   (if (< n 10) (digit-text n) (string-concat (decimal-of (quot n 10)) (digit-text (- n (* 10 (quot n 10)))))))
 
+;; `driver EC|BC PATTERN` prints the groups of the first match instead:
+;; ten `start:end;` tokens (byte offsets into the line), or `-` for no
+;; match, or `!` when the span could not be re-walked.
+(defn- captures-mode [] :i64
+  (let [prog (rx/compile-pattern (arg "1") (= (string-code-point-at (arg "0") 0) 69))]
+    (if (rx/error? prog)
+      (do (emit prog) (emit (nl)) 2)
+      (let [text (stdin "")
+            n (string-byte-length text)
+            hi (let [k (string-find-byte text 10 0)] (if (< k 0) n k))
+            r (rx/find prog text 0 0 hi)]
+        (if (< r 0)
+          (do (emit "-") (emit (nl)) 1)
+          (do (emit (rx/captures prog text 0 hi r)) (emit (nl)) 0))))))
+
 (defn main [] :i64
+  (if (= 2 (string-byte-length (arg "0")))
+    (captures-mode)
+    (main-find)))
+
+(defn- main-find [] :i64
   (let [prog (rx/compile-pattern (arg "1") (string=? (arg "0") "E"))]
     (if (rx/error? prog)
       (do (emit prog) (emit (nl)) 2)
