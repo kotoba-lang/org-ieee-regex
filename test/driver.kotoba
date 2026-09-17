@@ -2,6 +2,7 @@
 ;; and prints what /usr/bin/grep -ob would print for its first match --
 ;; `offset:match` -- then a second line, `M` or `-`, for whether the line
 ;; matched at all (grep -o skips empty matches; the exit status does not).
+;; A match the literal prefilter would have skipped exits 3 by name.
 (ns driver.core (:export [main]) (:require [regex.core :as rx]))
 
 (defn arg [i :string] :string (typed-cap-call :cli/args :string :string i))
@@ -23,9 +24,16 @@
             r (rx/find prog text 0 0 hi)]
         (if (< r 0)
           (do (emit "-") (emit (nl)) 1)
-          (do (first-nonempty prog text 0 hi)
-              (emit "M") (emit (nl))
-              0))))))
+          ;; A matching line the prefilter would have skipped is the one
+          ;; unsoundness the prefilter can have; named, exit 3.
+          (if (unsound? (rx/prefilter (arg "1") (string=? (arg "0") "E")) (string-substring text 0 hi))
+            (do (emit "PREFILTER-UNSOUND") (emit (nl)) 3)
+            (do (first-nonempty prog text 0 hi)
+                (emit "M") (emit (nl))
+                0)))))))
+
+(defn- unsound? [runs :string line :string] :bool
+  (if (= 0 (string-byte-length runs)) false (not (rx/holds-run? line runs 0))))
 
 ;; As grep -o: the first NON-EMPTY match, searching on past an empty one.
 (defn- cp-width [c :i64] :i64

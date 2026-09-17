@@ -41,7 +41,13 @@
    ;; BRE: * is a quantifier; + ? ( ) { } | are literals unless escaped.
    ["B" "a*b" "caab"] ["B" "a+b" "a+b"] ["B" "a+b" "aab"] ["B" "a\\+b" "aab"] ["B" "(x)" "(x)"] ["B" "\\(x\\)" "x"]
    ["B" "a\\|b" "b"] ["B" "a|b" "a|b"] ["B" "a\\{2\\}" "aaa"] ["B" "a{2}" "a{2}"] ["B" "a\\?b" "b"]
-   ["B" "^foo" "foo"] ["B" "foo$" "xfoo"] ["B" "[0-9]*" "abc12"] ["B" "\\." "a.b"]])
+   ["B" "^foo" "foo"] ["B" "foo$" "xfoo"] ["B" "[0-9]*" "abc12"] ["B" "\\." "a.b"]
+   ;; BRE context (2026-09-17): `^` `$` `*` literal where they cannot anchor
+   ;; or repeat, an anchor after `\(` / `\|` and before `\)`; `\t` a tab.
+   ["B" "a^b" "xa^b"] ["B" "a$b" "xa$b"] ["B" "*b" "a*b"] ["B" "^*b" "**b"] ["B" "^*b" "*b"] ["B" "\\(*b\\)" "a*b"]
+   ["B" "\\(^b\\)" "b"] ["B" "\\(^b\\)" "xb"] ["B" "a\\|^b" "xb"] ["B" "a\\|^b" "b"]
+   ["B" "b$\\|x" "ab$"] ["B" "x\\|b$" "ab"] ["B" "\\(b$\\)" "ab"] ["B" "\\(b$\\)" "ab$"]
+   ["B" "a\\tb" "a\tb"] ["B" "a\\tb" "atb"] ["B" "ab\\{0,1\\}c" "ac"] ["E" "ab?c" "ac"] ["E" "ab{0,1}c" "ac"] ["E" "(ab|cd)e" "xcde"] ["E" "a\\tb" "a\tb"] ["E" "a^b" "a^b"] ["E" "a$b" "a$b"]])
 
 ;; Patterns that must be refused (grep's own message differs; the exit 2 is
 ;; what is compared, the message is ours).
