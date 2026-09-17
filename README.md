@@ -9,7 +9,20 @@ and `awk`, linked with `--source-path`.
 (rx/compile-pattern "^(foo|bar)+" true)   ; ERE → program string, or "!" + message
 (rx/matches? prog text lo hi)             ; is there a match in the line [lo, hi)?
 (rx/find prog text lo from hi)            ; leftmost-longest: start*2^32 + end, or -1
+(rx/prefilter pattern ere?)               ; newline-separated literal runs, one of which
+                                          ; every matching line holds; "" when none
+(rx/holds-run? line runs 0)               ; does the line hold one? (a host search)
 ```
+
+The prefilter is what makes the measured `-E` alternations of words run at
+the system utility's speed: `SIGILL|static_assert` over 5.4 MB is 10.4 s
+simulated on every line and 0.15 s simulated only on lines a host search
+admits. It lived in `org-ieee-grep` first (2026-09-17) and moved here so
+`sed` and `awk` share it. It is conservative: a pattern with an alternative
+that has no literal prefix (`.*foo`, `[ab]c`) gets `""`, and the suite's
+driver exits 3 by name on any matching line the runs would have skipped —
+which is how `a\?b` over `b` (BRE `\?` makes the run's last character
+optional) was caught before it shipped.
 
 ## Measured, 2026-09-17
 
@@ -26,10 +39,21 @@ POSIX classes, `^` `$`, `\` escapes (a literal metacharacter; `\w \W \d \D
 
 `test/regex_test.cljk` compiles a driver that links the module, packages
 it, and compares its first match on each (pattern, line) against
-`/usr/bin/grep -ob` — POSIX leftmost-longest with byte offsets — for 70
+`/usr/bin/grep -ob` — POSIX leftmost-longest with byte offsets — for 90
 cases (each construct and its edges, `a|ab` → `ab`, `(a|ab)(c|bcd)` →
-`abcd`, multi-byte lines and classes, `(a*)*b`) plus 7 patterns both sides
-refuse. All byte-identical.
+`abcd`, multi-byte lines and classes, `(a*)*b`, the BRE context rules
+below) plus 10 patterns both sides refuse. All byte-identical.
+
+### BRE context, measured on `/usr/bin/grep` (macOS libc regex)
+
+`^` is an anchor at the start of the pattern, after `\(` and after `\|`,
+and a literal elsewhere (`a^b` matches `a^b`); `$` is an anchor at the end
+and before `\)`, a literal elsewhere — even before `\|` (`b$\|x` over
+`ab$` answers `b$`); `*` is a literal where an anchor `^` would be and
+right after one (`^*b` over `*b` answers `*b`). ERE has none of this. `\t`
+is a tab in both grammars, as `/usr/bin/grep` reads it. `\+` and `\?` are
+one-or-more and optional in BRE as `/usr/bin/grep` reads them — where
+`/usr/bin/sed` reads a literal `+` and `?`; `sed` names that divergence.
 
 ## How it runs, and what it cost to learn
 
